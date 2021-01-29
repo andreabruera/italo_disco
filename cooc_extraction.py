@@ -1,102 +1,130 @@
 import os
+import math
+import random
 import spacy
 import re
 import string
 import collections
 import tqdm
 import argparse
+import multiprocessing
+import logging
 
 from tqdm import tqdm
 
+from file_reader import itWacReader, itWikiReader
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--corpus', default='itWac', choices=['itWac', 'itWiki'], help='indicates which corpus to use, whether itWac or itWiki')
+parser.add_argument('--corpus', required=True, choices=['itwac', 'wikipedia_italian'], help='indicates which corpus to use, whether \'itwac\' or \'wikipedia_italian\'')
+parser.add_argument('--input_path', required=True, type=str, help='Folder where the corpus files are to be found')
+parser.add_argument('--output_path', required=True, type=str, help='Folder where to store the output files')
+parser.add_argument('--max_vocabulary', default=50000, help='Max number of words considered')
+parser.add_argument('--window_size', default=5, help='Size of the window around the current word')
+parser.add_argument('--subsampling', action='store_true', help='Indicates whether to implement Word2Vec-style random subsampling of words depending on their frequency and a t parameter set to 0.00005: p_subsampling = 1 - math.sqrt((t/word_frequency))')
 args = parser.parse_args() 
+logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.INFO)
 
-puncts = string.punctuation
 all_counts = collections.defaultdict(int)
-vocab = collections.defaultdict(int)
+vocab = dict()
+subsample_dict = dict()
 
-cooc_matrix = collections.defaultdict(lambda : collections.defaultdict(int))
-weighted_window_matrix = collections.defaultdict(lambda : collections.defaultdict(int))
+corpus = itWacReader(args.input_path) if args.corpus == 'itwac' else itWikiReader(args.input_path)
+logging.info('Now counting word frequencies')
 
-
-class itWiki():
-    def __iter__(self):
-        for root, direct, files in os.walk('extracted_wiki_italian'):
-            print('Current folder: {}'.format(root))
-            for f in tqdm(files):
-                with open(os.path.join(root, f)) as i:
-                    for l in i:
-                        l = l.strip()
-                        if l != '' and 'https' not in l:
-                            l = re.sub(r'[^\w\s]+', ' ', l)
-                            l = re.sub(r'\s+', ' ', l)
-                            l = l.lower()
-                            l = l.split()
-                            if len(l) > 4:
-                                yield l 
-
-class itWac():
-
-    def __iter__(self):
-        for i in range(1, 22):
-            with open('itwac/itwac3.{}.xml'.format(i), encoding='utf-8', errors='ignore') as f:
-                sentence = []
-                for l in f:
-                    l = l.strip().split()
-                    if len(l) == 3:
-                        if l[1] != 'PUN' and l[1] != 'NUM':
-                            if l[1] != 'SENT':
-                                sentence.append(l[2])
-                            else:
-                                last_sentence = sentence.copy()
-                                sentence = []
-                                yield last_sentence
-
-corpus = itWac() if args.corpus == 'itWac' else itWiki()
-
-print('Now counting word frequencies')
-for l in corpus:
+for l in tqdm(corpus):
     for w in l:
         all_counts[w] += 1
 
+logging.info('Now finished counting word frequencies')
+
 counter = {c[0] : c[1] for c in sorted(all_counts.items(), key=lambda t: t[1], reverse=True)}
 
+os.makedirs(args.output_path, exist_ok=True)
+
 print('Now writing to file word frequencies')
-with open('italian_{}_counter.txt'.format(args.corpus), 'w') as o:
+with open(os.path.join(args.output_path, '{}_absolute_frequencies.txt'.format(args.corpus)), 'w') as o:
     full_counter = sum([v for k, v in counter.items()])
-    o.write('N_WORDS_TOTAL\t{}\n'.format(full_counter))
-    for i, count in enumerate(counter.items()):
-        o.write('{}\t{}\t{}\n'.format(i+1, count[0], count[1]))
-        vocab[w] = i
+    o.write('Frequency_rank\tLemma\tAbsolute frequency\tSubsampling probability\t(Number of words in total: {})\n'.format(full_counter))
+    for i, count in tqdm(enumerate(counter.items())):
+        word_rank = i+1
+        word_lemma = count[0]
+        absolute_frequency = count[1]
+        relative_frequency = float(absolute_frequency) / float(full_counter)
+        subsampling_prob = 1 - math.sqrt(0.00005/relative_frequency)
+        o.write('{}\t{}\t{}\t{}\t{}\n'.format(word_rank, word_lemma, absolute_frequency, relative_frequency, subsampling_prob))
+        vocab[word_lemma] = word_rank if word_rank <= args.max_vocabulary else 0
+        subsample_dict[word_rank] = subsampling_prob if word_rank <= args.max_vocabulary else 1.1
 
-print('Now counting co-occurrences')
-for l in corpus:
-    for index, w in enumerate(l):
+puncts = string.punctuation
+
+cooc_matrix = collections.defaultdict(lambda : collections.defaultdict(int))
+harmonic_window_matrix = collections.defaultdict(lambda : collections.defaultdict(int))
+w2v_window_matrix = collections.defaultdict(lambda : collections.defaultdict(int))
+
+print('Now counting full co-occurrences')
+for l in tqdm(corpus):
+
+    ### Turning words into indices
+    l = [vocab[w] for w in l if vocab[w] != 0]
+    ### Removing rare and extremely frequent words according to the subsampling parameter
+    if args.subsampling:
+        l = [word_index for word_index in l if random.random() > subsample_dict[word_index]]
+
+    ### Finally collecting co-occurrences
+    for index, current_word_index in enumerate(l):
+
         # Left window
-        left = [(l[word], 1/(index-abs(word))) for word in range(max(index-5, 0), index)]
+        left = [(l[word], 1./float(index-abs(word)), float(args.window_size+1-(index-abs(word)))/float(args.window_size)) for word in range(max(index-args.window_size, 0), index)]
         # Right window
-        right = [(l[word], 1/(abs(word)-index)) for word in range(index+1, min(index+5, len(l)-1))]
-        print(left)
-        print(right)
+        right = [(l[word], 1./float(abs(word)-index), float(args.window_size+1-(abs(word)-index))/float(args.window_size)) for word in range(index+1, min(index+args.window_size, len(l)-1))]
         window = left + right
-        current_index = vocab[w]
-        for cooc_word, importance in window:
-            cooc_index = vocab[cooc_word]
-            cooc_matrix[current_index][cooc_index] += 1
-            weighted_window_matrix[current_index][cooc_index] += importance
+        for cooc_index, harmonic_distance, w2v_distance in window:
+            cooc_matrix[current_word_index][cooc_index] += 1
 
-for i in [50000, 100000, 150000]:
-    for count_dict, label in [(cooc_matrix, 'cooc'), (weighted_window_matrix, 'weighted_window')]:
-        print('Now writing co-occurrences with max vocabulary={} and window weighting mode={}'.format(i, label))
+            ### Also collecting other window weightings
+            harmonic_window_matrix[current_word_index][cooc_index] += harmonic_distance
+            w2v_window_matrix[current_word_index][cooc_index] += w2v_distance
 
-        selected_vocab = [k for k, v in counter.items() if v > i]
+### Adding the diagonals as simple word counts
+for w, absolute_frequency in counter.items(): 
 
-        cooc_out = '{}_{}_50000'.format(args.corpus, label)
-        os.makedirs(cooc_out, exist_ok=True)
-        for word in selected_vocab:
-            index = vocab[word]
-            with open(os.path.join(cooc_out, 'word_{:05}.{}'.format(index, label)), 'w') as o:
-                for word_two in selected_vocab:
-                    index_two = vocab[word_two]
-                    o.write('{}\t{}'.format(index_two, count_dict[index][index_two]))
+    word_index = vocab[w]
+
+    cooc_matrix[word_index][word_index] = absolute_frequency
+    harmonic_window_matrix[word_index][word_index] = absolute_frequency
+    w2v_window_matrix[word_index][word_index] = absolute_frequency
+
+### Now writing to file the co-occurrences
+
+logging.info('Now writing co-occurrences...')
+
+### Cleaning up the vocabulary and computing the relative frequencies
+
+relevant_words = ['cane', 'gatto', 'cavallo', 'leone', 'coniglio', 'pollo', 'topo', 'aquila', 'mucca', 'tartaruga', 'letto', 'carta', 'tavolo', 'piatto', 'camera', 'ascia', 'coltello', 'radio', 'computer', 'vite', 'furetto', 'balena', 'zebra', 'giraffa', 'capra', 'delfino', 'medusa', 'agnello', 'elefante', 'pinguino', 'foca', 'asino', 'scimmia', 'corvo', 'leopardo', 'divano', 'chiodo', 'tazza', 'mattarello', 'telefono', 'lavatrice', 'busta', 'penna', 'pentola', 'sega', 'pinza', 'sedia', 'armadio', 'forchetta', 'ciotola']
+#vocab = {k : v for k, v in vocab.items() if v != 0}
+eeg_vocab = {k : vocab[k] for k in relevant_words}
+
+relative_counter = {vocab[w] : (counter[w]+0.1) / float(full_counter) for w in vocab.keys()}
+
+cooc_out = os.path.join(args.output_path, 'co_occurrences_{}_vocab_{}_window_{}_subsampling_{}'.format(args.corpus, args.max_vocabulary, args.window_size, args.subsampling))
+os.makedirs(cooc_out, exist_ok=True)
+
+for word_lemma, word_index_one in tqdm(eeg_vocab.items()):
+    short_folder = word_lemma[:3]
+    word_out = os.path.join(cooc_out, short_folder)
+    os.makedirs(word_out, exist_ok=True)
+    with open(os.path.join(word_out, '{}.cooc'.format(word_lemma)), 'w') as o:
+        o.write('Co-oc word\tAbsolute co-oc\tRelative co-oc\tPPMI\tHarmonic weight co-oc\tW2V co-oc\n')
+        for word_lemma_two, word_index_two in eeg_vocab.items():
+
+            absolute_cooc = cooc_matrix[word_index_one][word_index_two] 
+            absolute_freq_one = cooc_matrix[word_index_one][word_index_one] 
+            absolute_freq_two = cooc_matrix[word_index_two][word_index_two]
+
+            ### Computing the (Laplacian smoothed) relative cooccurrences counts
+            relative_cooc = (absolute_cooc+0.1) / float(full_counter)
+            relative_freq_one = relative_counter[word_index_one]
+            relative_freq_two = relative_counter[word_index_two]
+            
+            ppmi_score = max(0, math.log((relative_cooc / (relative_freq_one * relative_freq_two)), 2))
+            o.write('{}\t{}\t{}\t{}\t{}\t{}\n'.format(word_lemma_two, absolute_cooc, relative_cooc, ppmi_score, harmonic_window_matrix[word_index_one][word_index_two], w2v_window_matrix[word_index_one][word_index_two]))
