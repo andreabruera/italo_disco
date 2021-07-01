@@ -1,10 +1,15 @@
+import collections
 import logging
+import math
 import multiprocessing
+import numpy
 import os
 
+from scipy import sparse
 from tqdm import tqdm
 
-from utils import count_frequencies, count_coocs
+from utils import count_frequencies, count_coocs, prepare_combined_paths, \
+                  write_coocs_and_ppmi_to_file
 
 logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.INFO)
 
@@ -13,31 +18,11 @@ logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S
 output_folder = '/import/cogsci/andrea/github/SISSA-EEG/resources'
 os.makedirs(output_folder, exist_ok=True)
 
-# Setting up the input paths
-
-'''
-logging.info('Loading ItWac files')
-itwac_path = '/import/cogsci/andrea/dataset/corpora/itwac_lemma_reorganized'
-assert os.path.exists(itwac_path)
-
-itwac_paths = [os.path.join(root, f) for root, direct, files in os.walk(itwac_path) for f in files]
-'''
-logging.info('Loading OpenSubtitles files')
-subs_path = '/import/cogsci/andrea/dataset/corpora/open_subtitles_cleaned'
-assert os.path.exists(subs_path)
-
-subs_paths = [os.path.join(root, f) for root, direct, files in os.walk(subs_path) for f in files]
-'''
-
-paths = itwac_paths.copy() + subs_paths.copy()
-
-del subs_paths
-del itwac_paths
-'''
+combined_paths = prepare_combined_paths()
 
 logging.info('Counting frequencies')
 with multiprocessing.Pool() as p:
-    counters = p.map(count_frequencies, subs_paths)
+    counters = p.map(count_frequencies, combined_paths)
     p.terminate()
     p.join()
 logging.info('Done counting frequencies')
@@ -55,10 +40,13 @@ del counters
 logging.info('Done merging counters')
 logging.info('Vocabulary size: {}'.format(len(final_counter)))
 
-counter = {c[0] : c[1] for c in sorted(final_counter.items(), key=lambda t: t[1], reverse=True)}
-del final_counter
+sorted_freqs = sorted(final_counter.items(), key=lambda t: t[1], reverse=True)
+counter = {c[0] : c[1] for c in sorted_freqs}
+
+#del final_counter
 
 vocab = dict()
+index_counter = dict()
 
 logging.info('Now writing to file word frequencies')
 with open(os.path.join(output_folder, 'itwac_and_subs_frequencies.txt'), 'w') as o:
@@ -73,40 +61,54 @@ with open(os.path.join(output_folder, 'itwac_and_subs_frequencies.txt'), 'w') as
     for i, count in tqdm(enumerate(counter.items())):
         word_rank = i+1
         word = count[0]
-        absolute_frequency = count[1]
 
-        vocab[word] = word_rank if word_rank <= 20000000000 else 0
-        #subsample_dict[word_rank] = subsampling_prob if word_rank <= 2000000000000 else 1.1
-        #subsampling_prob = 1 - math.sqrt(0.00005/relative_frequency)
+        if word_rank > 150000:
+            vocab[word] =  0
+        else:
+            vocab[word] = word_rank
+            #subsample_dict[word_rank] = subsampling_prob if word_rank <= 2000000000000 else 1.1
+            #subsampling_prob = 1 - math.sqrt(0.00005/relative_frequency)
 
-        relative_frequency = float(absolute_frequency) / float(full_counter)
-        o.write('{}\t{}\t{}\t{}\n'.format(word_rank, \
-                                              word, \
-                                              absolute_frequency, \
-                                              relative_frequency, \
-                                              #subsampling_prob, \
-                                              ))
+            absolute_frequency = count[1]
+            relative_frequency = float(absolute_frequency) / float(full_counter)
+            index_counter[word_rank] = [absolute_frequency, relative_frequency]
+            o.write('{}\t{}\t{}\t{}\n'.format(word_rank, \
+                                                  word, \
+                                                  absolute_frequency, \
+                                                  relative_frequency, \
+                                                  #subsampling_prob, \
+                                                  ))
 
+del final_counter
 logging.info('Counting co-occurrences')
-with multiprocessing.Pool() as p:
-    coocs = p.map(count_coocs, [[s, vocab] for s in subs_paths])
-    p.terminate()
-    p.join()
+
+cooc_matrix = collections.defaultdict(lambda : collections.defaultdict(int))
+for s in tqdm(combined_paths):
+    cooc_matrix = count_coocs([s, vocab, cooc_matrix])
+
 logging.info('Done counting co-occurrences')
-logging.info('Now merging co-occurrences')
+    
+inverted_vocab = {v : k for k, v in vocab.items()}
+reduced_vocab = [w for w, i in vocab.items() if i != 0]
 
-final_coocs = dict()
-for plain_coocs in coocs:
+logging.info('Writing to file')
 
-    for k_one, v_one in plain_coocs.items():
-        if k_one not in final_coocs.keys():
-            final_coocs[k_one] = dict()
-        for k_two, v_two in v_one.items():
-            if k_two not in final_coocs[k_one].keys():
-                final_coocs[k_one][k_two] = v_two
-            else:
-                final_counter[k_one][k_two] += v_two
-del coocs
-logging.info('Done merging co-occurrences')
+for word in tqdm(reduced_vocab):
 
-import pdb; pdb.set_trace()
+    index = vocab[word]
+    current_word_coocs = cooc_matrix[index].copy()
+    del cooc_matrix[index]
+    short_folder = word[:3]
+    word_out = os.path.join(output_folder,\
+                            'cooc_combined_corpora_window_5', \
+                            short_folder)
+    os.makedirs(word_out, exist_ok=True)
+
+    write_coocs_and_ppmi_to_file([current_word_coocs, \
+                         word, \
+                         index, \
+                         word_out, \
+                         full_counter, \
+                         inverted_vocab, \
+                         index_counter, \
+                         ])
